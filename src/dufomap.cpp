@@ -335,113 +335,159 @@ void filterminDistance(PointCloud& cloud, ufo::Point origin, float min_distance)
 	});
 }
 
+/**
+ * [功能描述]：dufomap程序的主函数，用于处理点云数据并生成动态物体过滤后的地图
+ * @param argc：命令行参数个数
+ * @param argv：命令行参数数组，argv[1]为点云文件夹路径，argv[2]为可选的配置文件路径
+ * @return 返回0表示程序正常退出
+ */
 int main(int argc, char* argv[])
 {
+	// 检查命令行参数是否足够
 	if (1 >= argc) {
 		std::cout << "[ERROR] Please running by: " << argv[0] << " [pcd_folder] [optional: config_file_path]";
 		return 0;
 	}
 
+	// 获取点云数据文件夹路径
 	std::filesystem::path path(argv[1]);
 	std::string config_file_path;
+	// 如果提供了配置文件路径，则使用用户指定的路径；否则使用默认路径
 	if (argc > 2)
 		config_file_path = argv[2];
 	else
 		config_file_path = std::string(argv[1]) + "/dufomap.toml";
 
+	// 读取配置文件
 	auto config = readConfig(std::filesystem::path(config_file_path));
 	std::cout << "[LOG] Step 1: Successfully read configuration from: " << config_file_path <<std::endl;
+	
+	// 创建UFO地图，包含SEEN_FREE（已观察自由空间）、REFLECTION（反射率）和LABEL（标签）三种地图类型
+	// 使用配置文件中的分辨率和层级参数初始化地图
 	ufo::Map<ufo::MapType::SEEN_FREE | ufo::MapType::REFLECTION | ufo::MapType::LABEL> map(
 	    config.map.resolution, config.map.levels);
+	// 预分配内存空间，以容纳1亿个点，提高性能
 	map.reserve(100'000'000);
 
+	// 扫描并收集所有需要处理的PCD文件
 	std::vector<std::filesystem::path> pcds;
 	for (const auto& entry : std::filesystem::directory_iterator(path / "pcd")) {
+		// 跳过非常规文件（如目录）
 		if (!entry.is_regular_file()) {
 			continue;
 		}
+		// 从文件名中提取索引号
 		std::size_t i = std::stoul(entry.path().stem());
+		// 只处理配置文件中指定范围内的文件
 		if (config.dataset.first <= i && config.dataset.last >= i) {
 			pcds.push_back(entry.path().filename());
 		}
 	}
+	// 按文件名排序，确保按时间顺序处理
 	std::ranges::sort(pcds);
 	// std::cout << config << std::endl;
+	// 限制处理的文件数量为配置文件中指定的数量
 	pcds.resize(std::min(pcds.size(), config.dataset.num));
 
+	// 创建计时器，用于性能分析
 	ufo::Timing timing;
 	timing.start("Total");
 
+	// 用于累积所有点云数据的容器
 	ufo::PointCloudColor cloud_acc;
 
 	std::cout << "[LOG] Step 2: Starting Processing data from: " << path << '\n';
+	// 隐藏控制台光标，避免进度条显示时出现闪烁
 	indicators::show_console_cursor(false);
+	// 创建进度条，用于显示处理进度
 	indicators::BlockProgressBar bar{
-		indicators::option::BarWidth{50},
-		indicators::option::Start{"["},
-		indicators::option::End{"]"},
-		indicators::option::PrefixText{"[LOG] Running dufomap "},
-		indicators::option::ForegroundColor{indicators::Color::white},
-		indicators::option::ShowElapsedTime{true},
-		indicators::option::ShowRemainingTime{true},
-		indicators::option::FontStyles{std::vector<indicators::FontStyle>{indicators::FontStyle::bold}}
+		indicators::option::BarWidth{50},                    // 进度条宽度为50个字符
+		indicators::option::Start{"["},                      // 进度条起始符号
+		indicators::option::End{"]"},                        // 进度条结束符号
+		indicators::option::PrefixText{"[LOG] Running dufomap "},  // 进度条前缀文本
+		indicators::option::ForegroundColor{indicators::Color::white},  // 前景色为白色
+		indicators::option::ShowElapsedTime{true},           // 显示已用时间
+		indicators::option::ShowRemainingTime{true},         // 显示剩余时间
+		indicators::option::FontStyles{std::vector<indicators::FontStyle>{indicators::FontStyle::bold}}  // 粗体字
 	};
 	
+	// 遍历处理每个PCD文件
 	for (std::size_t i{}; std::string filename : pcds) {
+		// 更新进度条显示当前处理进度百分比
 		bar.set_progress(100 * i / pcds.size());
 		++i;
+		// 设置计时器标签，记录处理进度
 		timing.setTag("Total " + std::to_string(i) + " of " + std::to_string(pcds.size()) +
 		              " (" + std::to_string(100 * i / pcds.size()) + "%)");
 
+		// 当前帧点云和视点位姿
 		ufo::PointCloudColor cloud;
 		ufo::Pose6f          viewpoint;
+		// 开始计时：读取点云文件
 		timing[1].start("Read");
 		ufo::readPointCloudPCD(path / "pcd" / filename, cloud, viewpoint);
 		timing[1].stop();
 
+		// 过滤掉距离传感器太近的点（例如自车身上的点），避免误判
 		// NOTE(Qingwen): lots of user facing about ego points inside data, we filterminDistance around ego agent.
 		filterminDistance(cloud, viewpoint.translation, config.integration.min_range);
 
+		// 将当前帧点云累积到总点云中，用于后续的静态点提取
 		cloud_acc.insert(std::end(cloud_acc), std::cbegin(cloud), std::cend(cloud));
 
+		// 将点云数据集成到UFO地图中，包括占用信息和自由空间信息
 		ufo::insertPointCloud(map, cloud, viewpoint.translation, config.integration,
 		                      config.propagate);
 
+		// 如果启用了详细输出模式，则打印计时信息
 		if (config.printing.verbose) {
 			timing[2] = config.integration.timing;
 			timing.print(true, true, 2, 4);
 		}
 	}
+	// 恢复显示控制台光标
 	indicators::show_console_cursor(true);
 	std::cout << "\033[0m\n[LOG] Step 3: Finished Processing data. Start saving map... " << std::endl;
 	// bar.is_completed();
+	
+	// 如果在插入点云时没有实时传播，则在所有点云处理完后统一传播
 	if (!config.propagate) {
 		timing[3].start("Propagate");
-		map.propagateModified();
+		map.propagateModified();  // 传播修改后的节点信息到整个八叉树
 		timing[3].stop();
 	}
 
+	// 开始计时：聚类操作
 	timing[4].start("Cluster");
+	// 如果启用了聚类功能，则对地图进行聚类处理（用于标识动态物体）
 	if (config.clustering.cluster) {
 		cluster(map, config.clustering);
 	}
 	timing[4].stop();
 
+	// 开始计时：查询静态点
 	timing[5].start("Query");
+	// 存储静态点云（过滤掉动态物体后的点云）
 	ufo::PointCloudColor cloud_static;
 
+	// 遍历累积的所有点云，筛选出静态点
 	for (auto& p : cloud_acc) {
+		// 如果该点在地图中未被标记为自由空间（即为占用点），则认为是静态点
 		if (!map.seenFree(p))
 			cloud_static.push_back(p);
 	}
 
 	timing[5].stop();
 
+	// 开始计时：写入文件
 	timing[6].start("write");
+	// 将过滤后的静态点云保存为PCD文件
 	ufo::writePointCloudPCD(path / (config.output.filename + ".pcd"), cloud_static);
 	timing[6].stop();
+	// 停止总计时
 	timing.stop();
 
+	// 打印详细的计时统计信息
 	timing[2] = config.integration.timing;
 	timing.print(true, true, 2, 4);
 	std::cout << "[LOG]: Finished! ^v^.. Clean output map with " << cloud_static.size() << " points save in " << path / (config.output.filename + ".pcd") << '\n';
